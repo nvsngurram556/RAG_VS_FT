@@ -10,6 +10,14 @@ import pickle
 from rank_bm25 import BM25Okapi
 import argparse
 import torch
+from rich.console import Console
+from rich.table import Table
+import time
+import streamlit as st
+try:
+    import gradio as gr
+except ImportError:
+    gr = None
 
 # Configure Tesseract path if needed (Windows users typically need this)
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -225,6 +233,140 @@ def filter_output(answer):
             return "Answer uncertain. Please verify."
     return answer
 
+
+# --- Helper functions for answering and UI ---
+def summarize_with_gpt2(prompt, tokenizer, model_gpt2, max_new_tokens=60):
+    # Build inputs leaving room for generation
+    max_context_length = model_gpt2.config.n_positions
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_context_length - max_new_tokens
+    )
+    available_space = max_context_length - inputs["input_ids"].shape[1]
+    if available_space < max_new_tokens:
+        max_new_tokens = max(10, available_space)
+    outputs = model_gpt2.generate(
+        inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id
+    )
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = generated_text.split("Answer:")[-1].strip()
+    sentences = answer.split(". ")
+    short_answer = ". ".join(sentences[:2]) + "."
+    return filter_output(short_answer)
+
+def compute_confidence_from_rerank(reranked_results):
+    if not reranked_results:
+        return 0.0
+    scores = [r.get("rerank_score", 0.0) for r in reranked_results]
+    mn, mx = min(scores), max(scores)
+    if mx - mn < 1e-6:
+        return 0.5
+    # Normalize top score to [0,1]
+    top = scores[0]
+    return float((top - mn) / (mx - mn))
+
+def answer_query_rag(query, retrieval_mode, top_k, chunks_texts, faiss_index, bm25, sbert_model, cross_encoder_model, tokenizer, model_gpt2):
+    t0 = time.time()
+    # Retrieve
+    if retrieval_mode == "dense":
+        base_results = search_dense(query, sbert_model, faiss_index, chunks_texts, top_k=top_k)
+    elif retrieval_mode == "sparse":
+        base_results = search_sparse(query, bm25, chunks_texts, top_k=top_k)
+    else:
+        base_results = hybrid_retrieve(query, sbert_model, faiss_index, bm25, chunks_texts, top_k=top_k, alpha=0.5)
+    # Rerank
+    reranked = rerank_with_cross_encoder(query, base_results, cross_encoder_model, top_k=top_k)
+    # Build prompt with concise instruction
+    context = "\n\n".join([r["text"] for r in reranked])
+    prompt = (
+        "Summarize the answer to the question in a short and concise way (max 3 sentences) "
+        "based on the following context:\n\n"
+        f"{context}\n\nQuestion: {query}\nAnswer:"
+    )
+    # Generate
+    answer = summarize_with_gpt2(prompt, tokenizer, model_gpt2, max_new_tokens=60)
+    latency = time.time() - t0
+    confidence = compute_confidence_from_rerank(reranked)
+    method = f"{retrieval_mode} + cross-encoder re-rank + GPT-2"
+    return {"answer": answer, "confidence": confidence, "method": method, "latency": latency, "retrieved": reranked}
+
+def answer_query_ft(query, tokenizer, model_gpt2):
+    t0 = time.time()
+    prompt = (
+        "Answer the question briefly and factually in at most 2 sentences.\n\n"
+        f"Question: {query}\nAnswer:"
+    )
+    answer = summarize_with_gpt2(prompt, tokenizer, model_gpt2, max_new_tokens=60)
+    latency = time.time() - t0
+    return {"answer": answer, "confidence": 0.5, "method": "Fine-Tuned (simulated: GPT-2 baseline)", "latency": latency, "retrieved": []}
+
+def launch_gradio(chunks_texts, faiss_index, bm25, sbert_model, cross_encoder_model, tokenizer, model_gpt2):
+    if gr is None:
+        raise RuntimeError("Gradio is not installed. Please `pip install gradio` and try again.")
+    def run(query, pipeline, retrieval_mode, chunk_size, top_k):
+        try:
+            validate_query(query)
+        except ValueError as e:
+            return str(e), 0.0, "validation", 0.0
+        if pipeline == "RAG":
+            res = answer_query_rag(query, retrieval_mode, int(top_k), chunks_texts, faiss_index, bm25, sbert_model, cross_encoder_model, tokenizer, model_gpt2)
+        else:
+            res = answer_query_ft(query, tokenizer, model_gpt2)
+        return res["answer"], float(res["confidence"]), res["method"], float(res["latency"])
+    with gr.Blocks() as demo:
+        gr.Markdown("## 📚 RAG vs FT — QA Demo")
+        with gr.Row():
+            query = gr.Textbox(label="Your query", placeholder="e.g., net profit after tax")
+        with gr.Row():
+            pipeline = gr.Radio(choices=["RAG", "FT"], value="RAG", label="Pipeline")
+            retrieval_mode = gr.Radio(choices=["dense", "sparse", "hybrid"], value="hybrid", label="Retrieval (RAG)")
+            chunk_size = gr.Dropdown(choices=[100, 400], value=400, label="Chunk size (loaded at start)")
+            top_k = gr.Slider(1, 10, value=5, step=1, label="Top-K")
+        btn = gr.Button("Run")
+        answer = gr.Textbox(label="Answer")
+        confidence = gr.Number(label="Confidence (0-1)")
+        method = gr.Textbox(label="Method used")
+        latency = gr.Number(label="Response time (s)")
+        btn.click(run, inputs=[query, pipeline, retrieval_mode, chunk_size, top_k], outputs=[answer, confidence, method, latency])
+    demo.launch()
+
+
+def streamlit_ui(chunks_texts, faiss_index, bm25, sbert_model, cross_encoder_model, tokenizer, model_gpt2):
+    st.title("📚 RAG vs FT — QA Demo")
+    
+    query = st.text_input("Enter your query:")
+    pipeline = st.radio("Choose pipeline:", ["RAG", "FT"])
+    retrieval_mode = st.selectbox("Retrieval mode (for RAG):", ["dense", "sparse", "hybrid"])
+    chunk_size = st.selectbox("Chunk size:", [100, 400])
+    top_k = st.slider("Top-K:", 1, 10, 5)
+    
+    if st.button("Run"):
+        if not query.strip():
+            st.warning("Please enter a valid query.")
+            return
+        
+        t0 = time.time()
+        if pipeline == "RAG":
+            res = answer_query_rag(query, retrieval_mode, top_k, chunks_texts, faiss_index, bm25, sbert_model, cross_encoder_model, tokenizer, model_gpt2)
+        else:
+            res = answer_query_ft(query, tokenizer, model_gpt2)
+        
+        latency = time.time() - t0
+        st.subheader("Answer")
+        st.write(res["answer"])
+        st.metric("Confidence", f"{res['confidence']:.2f}")
+        st.metric("Method", res["method"])
+        st.metric("Response Time", f"{latency:.2f} s")
+
 if __name__ == "__main__":
     pdf_file = "Annual_Report_2023_24.pdf"  # Replace with your PDF file
     output_file = "output.txt"
@@ -253,6 +395,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, choices=["dense", "sparse", "hybrid"], default="hybrid", help="Retrieval mode")
     parser.add_argument("--size", type=int, choices=[100, 400], default=400, help="Chunk size to use (100 or 400)")
     parser.add_argument("--top_k", type=int, default=5, help="Number of top results to return")
+    parser.add_argument("--ui", type=str, choices=["none", "gradio"], default="none", help="Launch a simple UI (gradio)")
+    parser.add_argument("--pipeline", type=str, choices=["RAG", "FT"], default="RAG", help="Choose between Retrieval-Augmented (RAG) or Fine-Tuned (FT) mode")
     args = parser.parse_args()
 
     query = args.query
@@ -321,69 +465,35 @@ if __name__ == "__main__":
     top_k = args.top_k
     mode = args.mode
 
-    if mode == "dense":
-        results = search_dense(query, model, faiss_index, chunks_texts, top_k=top_k)
-        print(f"Dense Retrieval Results for query: '{query}'\n")
-        for r in results:
-            print(f"Rank {r['rank']}: Chunk ID={r['chunk_id']}, Score={r['score']:.4f}")
-            print(f"Text: {r['text'][:150]}...\n")
-    elif mode == "sparse":
-        results = search_sparse(query, bm25, chunks_texts, top_k=top_k)
-        print(f"Sparse Retrieval Results for query: '{query}'\n")
-        for r in results:
-            print(f"Rank {r['rank']}: Chunk ID={r['chunk_id']}, Score={r['score']:.4f}")
-            print(f"Text: {r['text'][:150]}...\n")
-    else:  # hybrid
-        results = hybrid_retrieve(query, model, faiss_index, bm25, chunks_texts, top_k=top_k, alpha=0.5)
-        print(f"Hybrid Retrieval Results for query: '{query}'\n")
-        for r in results:
-            print(f"Rank {r['rank']}: Chunk ID={r['chunk_id']}, Combined Score={r['combined_score']:.4f}")
-            print(f"Text: {r['text'][:150]}...\n")
-
+    # Load cross-encoder and GPT-2 once
     cross_encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    reranked_results = rerank_with_cross_encoder(query, results, cross_encoder_model, top_k=top_k)
-    print(f"Re-ranked Results with CrossEncoder for query: '{query}'\n")
-    for r in reranked_results:
-        print(f"Rank {r['rank']}: Chunk ID={r['chunk_id']}, Rerank Score={r['rerank_score']:.4f}")
-        print(f"Text: {r['text'][:150]}...\n")
-
-    # Load GPT-2 model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     model_gpt2 = AutoModelForCausalLM.from_pretrained("gpt2")
-    # Ensure pad token exists (GPT-2 doesn't have one by default)
     tokenizer.pad_token = tokenizer.eos_token
 
+    if args.ui == "gradio":
+        # Launch interactive UI
+        launch_gradio(chunks_texts, faiss_index, bm25, model, cross_encoder_model, tokenizer, model_gpt2)
+        exit(0)
 
-    # Prepare prompt from top reranked chunks and query
-    context = "\n\n".join([r["text"] for r in reranked_results])
-    prompt = f"Answer the question based on the following context:\n\n{context}\n\nQuestion: {query}\nAnswer:"
+    # CLI single-run path
+    pipeline_choice = args.pipeline
+    if pipeline_choice == "RAG":
+        res = answer_query_rag(query, mode, top_k, chunks_texts, faiss_index, bm25, model, cross_encoder_model, tokenizer, model_gpt2)
+    else:
+        res = answer_query_ft(query, tokenizer, model_gpt2)
 
-    # Prepare prompt with dynamic truncation using tokenizer
-    max_context_length = model_gpt2.config.n_positions
-    max_new_tokens = 60
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context_length - max_new_tokens)
-    # If input is near the limit, adjust max_new_tokens dynamically
-    available_space = max_context_length - inputs["input_ids"].shape[1]
-    if available_space < max_new_tokens:
-        max_new_tokens = max(10, available_space)
-    # Generate answer
-    outputs = model_gpt2.generate(
-        inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id
-    )
+    print("\n=== Result ===")
+    print(f"Answer: {res['answer']}")
+    print(f"Confidence: {res['confidence']:.3f}")
+    print(f"Method: {res['method']}")
+    print(f"Response time: {res['latency']:.2f}s")
 
-    # Decode generated tokens and extract answer
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    answer = generated_text.split("Answer:")[-1].strip()
-    answer = answer.split(". ")
-    sentences = answer
-    short_answer = ". ".join(sentences[:2]) + "."
-    answer = filter_output(short_answer)
-    print("Final Answer:")
-    print(answer)
+    console = Console()
+    table = Table(title="QA Result")
+    table.add_column("Answer", style="cyan")
+    table.add_column("Confidence", style="green")
+    table.add_column("Method", style="magenta")
+    table.add_column("Latency (s)", style="yellow")
+    table.add_row(res["answer"], f"{res['confidence']:.2f}", res["method"], f"{res['latency']:.2f}")
+    console.print(table)
